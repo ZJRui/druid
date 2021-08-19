@@ -145,20 +145,48 @@ public class FilterChainImpl implements FilterChain {
     }
 
     public ConnectionProxy connection_connect(Properties info) throws SQLException {
+        /**
+         *注意this是调用链对象FilterChainImpl。 如果当前pos小于filterSize，
+         * 则会使用nextFilter获取下一个filter，其中nextFilter会执行pos++
+         * 然后得到nextFilter之后执行其 connection_connect方法。
+         * 从概念上说FilterChainImpl 也是Filter接口的实现类。 因此FilterChainImpl和 nextFilter都有connection_connect方法
+         *
+         *
+         * 我们知道在SpringMvc的filter中， 我们一般会首先执行filter的逻辑  然后filter的逻辑执行完了之后才会执行  filterChain.doFilter(request, response);
+         * 但是在Druid的filter中，比如statFilter中，他首先执行的是 connection = chain.connection_connect(info);
+         * 其中chain就是当前的FilterChainImpl对象，因此执行逻辑又进入当前connection_connect方法中
+         *
+         * 因此if 中的逻辑会执行到最后一个Filter，在最后一个Filter中执行 chain.connection_connect 获取到连接connection，然后再执行Filter中的其他逻辑，比如对connection
+         * 进行包装、修改等。
+         *
+         *
+         *
+         */
         if (this.pos < filterSize) {
             return nextFilter()
                     .connection_connect(this, info);
         }
 
+        /**
+         * 经过上面的分析我们知道 在先执行Filter的逻辑之前会先执行chain.connection_connect(info)
+         * 也就是下面的逻辑，这段逻辑 dataSource.getRawDriver 会返回我们配置文件中指定的驱动类 也就是驱动包中的
+         * com.mysql.cj.jdbc.Driver
+         */
         Driver driver = dataSource.getRawDriver();
         String url = dataSource.getRawJdbcUrl();
 
+        /**
+         * 使用Driver获取connection。 在MySQL中驱动就是com.mysql.cj.jdbc.Driver， connection就是ConnectionImpl
+         */
         Connection nativeConnection = driver.connect(url, info);
 
         if (nativeConnection == null) {
             return null;
         }
 
+        /**
+         * 但是在这里我们发现Druid返回的并不是原生MySQL驱动中的Connection对象ConnectionImpl，而是返回了Druid中的ConnectionProxyImpl
+         */
         return new ConnectionProxyImpl(dataSource, nativeConnection, info, dataSource.createConnectionId());
     }
 
@@ -3237,10 +3265,20 @@ public class FilterChainImpl implements FilterChain {
             return nextFilter().preparedStatement_executeQuery(this, statement);
         }
 
+        /**
+         * 注意这里 首先执行代了 statement.getRwaObject 这将会返回 PreparedStatementProxyImpl对象内部持有的
+         * 真正的PreparedStatement对象，也就是MySQL驱动包中提供的ClientPreparedStatement，
+         * 因此也就是执行真正的PreparedStatement的executeQuery，
+         * 然后获取返回值。 最终将这个返回值包装成 Druid的ResultSetProxy
+         */
         ResultSet resultSet = statement.getRawObject().executeQuery();
         if (resultSet == null) {
             return null;
         }
+
+        /**
+         *
+         */
         return new ResultSetProxyImpl(statement, resultSet, dataSource.createResultSetId(),
                 statement.getLastExecuteSql());
     }

@@ -40,6 +40,7 @@ import java.util.Calendar;
 import java.util.HashMap;
 import java.util.Map;
 
+import com.alibaba.druid.filter.FilterChainImpl;
 import com.alibaba.druid.proxy.jdbc.JdbcParameter.TYPE;
 
 /**
@@ -178,7 +179,16 @@ public class PreparedStatementProxyImpl extends StatementProxyImpl implements Pr
         lastExecuteStartNano = -1L;
         lastExecuteTimeNano = -1L;
 
-        return createChain().preparedStatement_executeQuery(this);
+        /**
+         * 创建一个FilterChainImpl，创建FilterChainImpl的逻辑就是从dataSource中获取在dataSource中配置的Filter
+         *  chain = new FilterChainImpl(this.getConnectionProxy().getDirectDataSource());
+         */
+        FilterChainImpl chain = createChain();
+        /**
+         * 然后执行chain的 preparedStatement_executeQuery
+         */
+        ResultSetProxy resultSetProxy = chain.preparedStatement_executeQuery(this);
+        return resultSetProxy;
     }
 
     @Override
