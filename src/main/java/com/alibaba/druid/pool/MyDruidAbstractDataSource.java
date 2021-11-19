@@ -1,7 +1,10 @@
 package com.alibaba.druid.pool;
 
+import com.alibaba.druid.DbType;
 import com.alibaba.druid.filter.Filter;
+import com.alibaba.druid.filter.FilterChainImpl;
 import com.alibaba.druid.proxy.jdbc.DataSourceProxy;
+import com.alibaba.druid.stat.JdbcDataSourceStat;
 import com.alibaba.druid.support.logging.Log;
 import com.alibaba.druid.support.logging.LogFactory;
 import com.alibaba.druid.util.DruidPasswordCallback;
@@ -15,15 +18,16 @@ import javax.security.auth.callback.PasswordCallback;
 import javax.sql.DataSource;
 import java.io.PrintWriter;
 import java.io.Serializable;
-import java.sql.Connection;
-import java.sql.Driver;
+import java.sql.*;
 import java.util.*;
+import java.util.Date;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.logging.Logger;
 
 @Data
 public class MyDruidAbstractDataSource   extends WrapperAdapter implements DruidAbstractDataSourceMBean, DataSource, DataSourceProxy, Serializable {
@@ -113,7 +117,7 @@ public class MyDruidAbstractDataSource   extends WrapperAdapter implements Druid
 
     protected volatile int                             maxOpenPreparedStatements                 = -1;
 
-    protected volatile List<String>                    connectionInitSqls;
+    protected volatile List<String> connectionInitSqls = new ArrayList<>();
 
     protected volatile String                          dbTypeName;
 
@@ -260,7 +264,7 @@ public class MyDruidAbstractDataSource   extends WrapperAdapter implements Druid
 //
 
 
-    DruidAbstractDataSource.PhysicalConnectionInfo createPhysicalConnection() {
+    DruidAbstractDataSource.PhysicalConnectionInfo createPhysicalConnection() throws  SQLException{
         String url = this.getJdbcUrl();
         Properties connectProperties = getConnectProperties();
         String user;
@@ -306,25 +310,403 @@ public class MyDruidAbstractDataSource   extends WrapperAdapter implements Druid
         Map<String, Object> globalVariables = initGlobalVariants ? new HashMap<>() : null;
         createStartNanosUpdater.set(this, connectStartNanoTime);
         creatingCountUpdater.incrementAndGet(this);
-        try{
+        try {
             conn = createPhysicalConnection(url, physicalConnectProperties);
+            connectedNanos = System.nanoTime();
+            if (conn == null) {
+                throw new SQLException("Connect error ,url " + url + ",driverClass" + this.driverClass);
+            }
+            initPhysicalConnection(conn, variables, globalVariables);
+            initedNanos = System.nanoTime();
+
+
+            validateConnection(conn);
+            validatedNanos = System.nanoTime();
+
+
+            setFailContinuous(false);
+            setCreateError(null);
+
+        } catch (SQLException exception) {
+            setCreateError(exception);
+            JdbcUtils.close(conn);
+            throw exception;
+        } catch (RuntimeException exception) {
+            setCreateError(exception);
+            JdbcUtils.close(conn);
+            throw exception;
+        } catch (Error error) {
+            createErrorCountUpdater.incrementAndGet(this);
+            setCreateError(error);
+            JdbcUtils.close(conn);
+            throw error;
+        }finally{
+            long nano = System.nanoTime() - connectStartNanoTime;
+            createTimespan += nano;
+            createCountUpdater.decrementAndGet(this);
+        }
+        return new DruidAbstractDataSource.PhysicalConnectionInfo(conn, connectStartNanoTime, initedNanos, validatedNanos, variables, globalVariables);
+
+
+    }
+    protected void setFailContinuous(boolean fail) {
+        if (fail) {
+            failContinuousTimeMillisUpdater.set(this, System.currentTimeMillis());
+        } else {
+            failContinuousTimeMillisUpdater.set(this, 0L);
         }
 
+        boolean currentState = failContinuousUpdater.get(this) == 1;
+        if (currentState == fail) {
+            return;
+        }
+
+        if (fail) {
+            failContinuousUpdater.set(this, 1);
+            if (LOG.isInfoEnabled()) {
+                LOG.info("{dataSource-" + this.getID() + "} failContinuous is true");
+            }
+        } else {
+            failContinuousUpdater.set(this, 0);
+            if (LOG.isInfoEnabled()) {
+                LOG.info("{dataSource-" + this.getID() + "} failContinuous is false");
+            }
+        }
+    }
+    public long getID() {
+        return this.id;
+    }
+
+    public void validateConnection(Connection connection) throws  SQLException {
+        String query = getValidationQuery();
+        if (connection.isClosed()) {
+            throw new SQLException("validateConnection :connection closed");
+        }
+        if (validConnectionChecker != null) {
+            boolean result;
+            Exception error = null;
+            try {
+                result=validConnectionChecker.isValidConnection(connection, validationQuery, validationQueryTimeout);
+                if (result && onFatalError) {
+                    lock.lock();
+                    try{
+                        if (onFatalError) {
+                            onFatalError=false;
+
+                        }
+                    }finally{
+                        lock.unlock();
+                    }
+                }
+            } catch (SQLException e) {
+                throw e;
+            } catch (Exception e) {
+                result=false;
+                error = e;
+            }
+            if (!result) {
+                SQLException sqlError=error!=null:new SQLException("validateConnection false" ,error):
+                new SQLException("validateConnection false");
+                throw sqlError;
+            }
+            return ;
+        }
+        if (null != query) {
+            Statement stmt = null;
+            ResultSet rs = null;
+            try {
+                stmt = connection.createStatement();
+                if (getValidationQueryTimeout() > 0) {
+                    stmt.setQueryTimeout(getValidationQueryTimeout());
+                }
+                rs = stmt.executeQuery(query);
+                if (!rs.next()) {
+                    throw new SQLException("validationQuery didn't return a row");
+                }
+
+                if (onFatalError) {
+                    lock.lock();
+                    try {
+                        if (onFatalError) {
+                            onFatalError = false;
+                        }
+                    }
+                    finally {
+                        lock.unlock();
+                    }
+                }
+            } finally {
+                JdbcUtils.close(rs);
+                JdbcUtils.close(stmt);
+            }
+        }
+
+
+    }
+    public void initPhysicalConnection(Connection connection,Map<String,Object>variables,Map<String,Object>globalVariables)throws  SQLException{
+        if (connection.getAutoCommit() != defaultAutoCommit) {
+            connection.setAutoCommit(defaultAutoCommit);
+        }
+        if (defaultReadOnly!=null) {
+            if (connection.isReadOnly() != defaultReadOnly) {
+                connection.setReadOnly(defaultReadOnly);
+
+            }
+        }
+        if (getDefaultTransactionIsolation() != null) {
+            if (connection.getTransactionIsolation() != getDefaultTransactionIsolation().intValue()) {
+                connection.setTransactionIsolation(getDefaultTransactionIsolation());
+            }
+        }
+        if (getDefaultCatalog() != null && getDefaultCatalog().length() != 0) {
+            connection.setCatalog(getDefaultCatalog());
+
+        }
+        Collection<String> initSqls = getConnectionInitSqls();
+        if (initSqls.size() == 0 && variables == null && globalVariables == null) {
+            return;
+        }
+        Statement statement=null;
+        try{
+            statement = connection.createStatement();
+            for (String sql : initSqls) {
+                if (sql == null) {
+                    continue;
+                }
+                statement.execute(sql);
+            }
+            DbType dbType = DbType.of(this.dbTypeName);
+            if (dbType == DbType.mysql || dbType == DbType.ads) {
+                if (variables != null) {
+                    ResultSet rs = null;
+                    try{
+                        rs=statement.executeQuery("show variables");
+                        while (rs.next()) {
+                            String name = rs.getString(1);
+                            Object value = rs.getObject(2);
+                            variables.put(name, value);
+                        }
+                    }finally{
+                        JdbcUtils.close(rs);
+                    }
+
+                }
+
+                if (globalVariables != null) {
+                    ResultSet rs = null;
+                    try{
+                        rs = statement.executeQuery("show global variables");
+                        while (rs.next()) {
+                            String name = rs.getString(1);
+                            Object value = rs.getObject(2);
+                            globalVariables.put(name, value);
+                        }
+
+                    }finally{
+                        JdbcUtils.close(rs);
+                    }
+                }
+            }//end if
+
+
+
+        }finally {
+            JdbcUtils.close(statement);
+        }
 
     }
 
 
 
-   public  void createPhysicalConnection(String url, Properties properties) {
-       Connection connectoin;
-       if()
-
-
+   public  Connection createPhysicalConnection(String url, Properties properties)throws SQLException {
+       Connection connection;
+       if(getProxyFilters().size()==0){
+           connection = getDriver().connect(url, properties);
+       }else{
+           connection = new FilterChainImpl(this).connection_connect(properties);
+       }
+       createCountUpdater.incrementAndGet(this);
+       return connection;
     }
 
     @Override
     public List<Filter> getProxyFilters() {
         return filters;
+    }
+
+    @Override
+    public long createConnectionId() {
+        return 0;
+    }
+
+    @Override
+    public long createStatementId() {
+        return 0;
+    }
+
+    @Override
+    public long createResultSetId() {
+        return 0;
+    }
+
+    @Override
+    public long createMetaDataId() {
+        return 0;
+    }
+
+    @Override
+    public long createTransactionId() {
+        return 0;
+    }
+
+    @Override
+    public void setLoginTimeout(int seconds) throws SQLException {
+
+    }
+
+    @Override
+    public int getLoginTimeout() {
+        return 0;
+    }
+
+    @Override
+    public Logger getParentLogger() throws SQLFeatureNotSupportedException {
+        return null;
+    }
+
+    @Override
+    public JdbcDataSourceStat getDataSourceStat() {
+        return null;
+    }
+
+    @Override
+    public String getDbType() {
+        return null;
+    }
+
+    @Override
+    public Driver getRawDriver() {
+        return null;
+    }
+
+    @Override
+    public String getUrl() {
+        return null;
+    }
+
+    @Override
+    public String getRawJdbcUrl() {
+        return null;
+    }
+
+    @Override
+    public String getDriverClassName() {
+        return null;
+    }
+
+    @Override
+    public long getConnectCount() {
+        return 0;
+    }
+
+    @Override
+    public long getCloseCount() {
+        return 0;
+    }
+
+    @Override
+    public long getConnectErrorCount() {
+        return 0;
+    }
+
+    @Override
+    public int getPoolingCount() {
+        return 0;
+    }
+
+    @Override
+    public long getRecycleCount() {
+        return 0;
+    }
+
+    @Override
+    public int getActiveCount() {
+        return 0;
+    }
+
+    @Override
+    public long getCreateTimespanMillis() {
+        return 0;
+    }
+
+    @Override
+    public List<String> getActiveConnectionStackTrace() {
+        return null;
+    }
+
+    @Override
+    public List<String> getFilterClassNames() {
+        return null;
+    }
+
+    @Override
+    public long getRemoveAbandonedCount() {
+        return 0;
+    }
+
+    @Override
+    public String getProperties() {
+        return null;
+    }
+
+    @Override
+    public int getRawDriverMinorVersion() {
+        return 0;
+    }
+
+    @Override
+    public int getRawDriverMajorVersion() {
+        return 0;
+    }
+
+    @Override
+    public String getValidConnectionCheckerClassName() {
+        return null;
+    }
+
+    @Override
+    public long[] getTransactionHistogramValues() {
+        return new long[0];
+    }
+
+    @Override
+    public long getCachedPreparedStatementAccessCount() {
+        return 0;
+    }
+
+    @Override
+    public int getDriverMajorVersion() {
+        return 0;
+    }
+
+    @Override
+    public int getDriverMinorVersion() {
+        return 0;
+    }
+
+    @Override
+    public String getExceptionSorterClassName() {
+        return null;
+    }
+
+    @Override
+    public Connection getConnection() throws SQLException {
+        return null;
+    }
+
+    @Override
+    public Connection getConnection(String username, String password) throws SQLException {
+        return null;
     }
 }
 

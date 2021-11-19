@@ -1590,6 +1590,8 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
             activeCount--;
             discardCount++;
 
+
+
             if (activeCount <= minIdle) {
                 emptySignal();
             }
@@ -1630,6 +1632,20 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
         }
     }
 
+    /**
+     * 注意连接池的定义是DruidCOnnectionHolder[] connections
+     *
+     * 而且连接池中存放的DruidConnectionHolder都是那些尚未使用的connection，这个尚未使用的connection数量是通过poolingCount来控制的。
+     *
+     * 在pollLast方法中，我们看到 当我们从连接池connections中取出一个connection的时候，会将其在连接池中清除，同时poolingCount减一。
+     * 这个时候connection处于active状态，因此activeCount++
+     *
+     *
+     *
+     * @param maxWait
+     * @return
+     * @throws SQLException
+     */
     private DruidPooledConnection getConnectionInternal(long maxWait) throws SQLException {
         if (closed) {
             connectErrorCountUpdater.incrementAndGet(this);
@@ -1654,11 +1670,18 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
         for (boolean createDirect = false;;) {
             if (createDirect) {
                 createStartNanosUpdater.set(this, System.nanoTime());
+                //期望是0， 将其更新为1，为什么期望creatingCountUpdater是0呢？ 因为在下面的代码中，createPhysical前后 compareAndSet
+                // 然后 decrementAndGet 也就是说compareAndSet更新为1之后 创建连接之后decrementAndGet 将其设置为0
+                //从这里我们可以看到 并发时刻只会有一个线程 createPhysicalConnection
                 if (creatingCountUpdater.compareAndSet(this, 0, 1)) {
+                    //创建物理连接
                     PhysicalConnectionInfo pyConnInfo = DruidDataSource.this.createPhysicalConnection();
+
+                    //Druid的连接池定义是 DruidConnectionHolder[] connections，也就是连接池中存放的是DruidConnectionHolder，  上面创建的是PhysicalConnectionInfo
                     holder = new DruidConnectionHolder(this, pyConnInfo);
                     holder.lastActiveTimeMillis = System.currentTimeMillis();
 
+                    //问题： 为什么要使用creatingCountUpdater  ，为什么为0的时候才进行create？
                     creatingCountUpdater.decrementAndGet(this);
                     directCreateCountUpdater.incrementAndGet(this);
 
@@ -1687,7 +1710,8 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
                     if (discard) {
                         JdbcUtils.close(pyConnInfo.getPhysicalConnection());
                     }
-                }
+                }// cas失败了
+
             }
 
             try {
@@ -1698,6 +1722,22 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
             }
 
             try {
+                /***
+                 * druid如何防止在获取不到连接时阻塞过多的业务线程？
+                 *
+                 * 通过上面的流程图和流程描述，如果非常极端的情况，池子里的连接完全不够用时，会阻塞过多的业务线程，甚至会阻塞超过maxWait这么久，有没有一种措施是可以在连接不够用的时候控制阻塞线程的个数，超过这个限制后直接报错，而不是陷入等待呢？
+                 *
+                 * druid其实支持这种策略的，在maxWaitThreadCount属性为默认值（-1）的情况下不启用，如果maxWaitThreadCount配置大于0，表示启用，这是druid做的一种丢弃措施，如果你不希望在池子里的连接完全不够用导阻塞的业务线程过多，就可以考虑配置该项，这个属性的意思是说在连接不够用时最多让多少个业务线程发生阻塞，流程1.2的图里没有体现这个开关的用途，可以在代码里查看，每次在pollLast方法里陷入等待前会把属性notEmptyWaitThreadCount进行累加，阻塞结束后会递减，由此可见notEmptyWaitThreadCount就是表示当前等待可用连接时阻塞的业务线程的总个数，而getConnectionInternal在每次调用pollLast前都会判断这样一段代码：
+                 *
+                 * if (maxWaitThreadCount > 0 && notEmptyWaitThreadCount >= maxWaitThreadCount) {
+                 *                     connectErrorCountUpdater.incrementAndGet(this);
+                 *                     throw new SQLException("maxWaitThreadCount " + maxWaitThreadCount + ", current wait Thread count "
+                 *                             + lock.getQueueLength()); //直接抛异常，而不是陷入等待状态阻塞业务线程
+                 *                 }
+                 * 可以看到，如果配置了maxWaitThreadCount所限制的等待线程个数，那么会直接判断当前陷入等待的业务线程是否超过了maxWaitThreadCount，一旦超过甚至不触发pollLast的调用（防止新增等待线程），直接抛错。
+                 *
+                 * 一般情况下不需要启用该项，一定要启用建议考虑好maxWaitThreadCount的取值，一般来说发生大量等待说明代码里存在不合理的地方：比如典型的连接池基本配置不合理，高qps的系统里maxActive配置过小；比如借出去的连接没有及时close归还；比如存在慢查询或者慢事务导致连接借出时间过久。这些要比配置maxWaitThreadCount更值得优先考虑，当然配置这个做一个极限保护也是没问题的，只是要结合实际情况考虑好取值。
+                 */
                 if (maxWaitThreadCount > 0
                         && notEmptyWaitThreadCount >= maxWaitThreadCount) {
                     connectErrorCountUpdater.incrementAndGet(this);
@@ -1740,6 +1780,8 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
                         && creatingCountUpdater.get(this) == 0
                         && createScheduler instanceof ScheduledThreadPoolExecutor) {
                     ScheduledThreadPoolExecutor executor = (ScheduledThreadPoolExecutor) createScheduler;
+                    //为什么这个地方 当Queue的size大于0的时候就 将createDirect设置为true？
+                    //createScheulder 的队列中存在任务的时候不可以通过线程池创建吗？
                     if (executor.getQueue().size() > 0) {
                         createDirect = true;
                         continue;
@@ -2270,7 +2312,9 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
 
     DruidConnectionHolder takeLast() throws InterruptedException, SQLException {
         try {
+            //poolingCount=0表示没有空闲可用的连接
             while (poolingCount == 0) {
+                //发送消息唤醒 CreateThread 创建Connection
                 emptySignal(); // send signal to CreateThread create connection
 
                 if (failFast && isFailContinuous()) {
@@ -2282,6 +2326,12 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
                     notEmptyWaitThreadPeak = notEmptyWaitThreadCount;
                 }
                 try {
+                    //等待 CreateThread创建连接之后 通过notEmpty.signal唤醒当前线程，或者 其他线程将connection归还之后 唤醒当前线程
+                    //注意 在await方法前 有 notEmptyWaitThreadCount++ ，在await之后（也就是当前线程被唤醒之后） 有notEmptyWaitThreadCount--
+                    //因此notEmptyWaitThreadCount 表示的含义是：当前有多少个线程 等待获取可用的连接
+
+                    //notEmpty的表层意思是不为空， 当可用连接为空的时候我们调用notEmpty的await方法阻塞当前线程。 当存在可用连接的时候（比如createThread创建了连接，或者其他线程归还了连接）
+                    // 就会调用notEmpty.signal 方法来通知 不为空，唤醒那些被阻塞的线程
                     notEmpty.await(); // signal by recycle or creator
                 } finally {
                     notEmptyWaitThreadCount--;
@@ -2314,7 +2364,9 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
         long estimate = nanos;
 
         for (;;) {
+            //表示connections中的可用连接数量为0
             if (poolingCount == 0) {
+                //通知线程创建Connection
                 emptySignal(); // send signal to CreateThread create connection
 
                 if (failFast && isFailContinuous()) {
@@ -2333,6 +2385,15 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
 
                 try {
                     long startEstimate = estimate;
+                    //notEmpty：当为空的时候调用awaitNanos 阻塞当前线程，等待createThread或者其他线程将连接归还后唤醒
+                    //问题：为什么一定要调用awaitNanos？
+                    /**
+                     * 这里为什么要awaitNanos？ 因为上面 的if 是 poolingCount=0 表示当前可用连接储量为0，因此 需要通知createThread 线程创建connection 或者等待其他线程 归还connection
+                     *
+                     * 因此当前线程需要等待 ，因此会执行awaitNanos，等有可用连接的时候 其他线程会调用notEmpty.signal 唤醒当前线程。
+                     *
+                     *当前线程执行了awaitNanos被阻塞，然后其他线程创建了connection或者归还了connection之后唤醒当前线程后，当前线程会执行for，在for中判断poolingCount不等于0，然后这个时候就会从连接池中取出一个connection
+                     */
                     estimate = notEmpty.awaitNanos(estimate); // signal by
                                                               // recycle or
                                                               // creator
@@ -2367,6 +2428,9 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
             }
 
             decrementPoolingCount();
+            //从这里 可以看出 poolingCount记录的是连接池中 还没有被使用的 可用连接数量。
+            //如果某一个在Connections中的连接被做为getConnection的返回值返回出去了，那么就将其在 连接池数组connections中清空
+            //同时poolingCount--
             DruidConnectionHolder last = connections[poolingCount];
             connections[poolingCount] = null;
 
@@ -2720,6 +2784,7 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
                         if (failFast) {
                             lock.lock();
                             try {
+                                //条件成立时调用singal，也就是连接池不为空， 此时存在可用连接，
                                 notEmpty.signalAll();
                             } finally {
                                 lock.unlock();
@@ -2841,6 +2906,7 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
         }
 
         public void run() {
+            //为什么 先调用countDown参考 DruidDataSource的init方法中的注释 createAndStartCreatorThread()
             initedLatch.countDown();
 
             long lastDiscardCount = 0;
@@ -2848,6 +2914,7 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
             for (;;) {
                 // addLast
                 try {
+                    //先获取锁，对DruidDataSource中所有volatile类型的变量的修改都必须要加锁
                     lock.lockInterruptibly();
                 } catch (InterruptedException e2) {
                     break;
@@ -2866,6 +2933,7 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
                         emptyWait = false;
                     }
 
+                    //createCount记录连接创建的次数，只增不减，在createPhysicalConnection方法中，创建了Connection之后会进行 createCountUpdater.incrementAndGet(this);就是对createCount++
                     if (emptyWait
                             && asyncInit && createCount < initialSize) {
                         emptyWait = false;
@@ -2877,6 +2945,7 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
                                 && (!(keepAlive && activeCount + poolingCount < minIdle))
                                 && !isFailContinuous()
                         ) {
+                            //阻塞当前线程不进行创建connection
                             empty.await();
                         }
 
@@ -2944,6 +3013,7 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
                     continue;
                 }
 
+                //将连接放入到连接池中
                 boolean result = put(connection);
                 if (!result) {
                     JdbcUtils.close(connection.getPhysicalConnection());
@@ -3950,6 +4020,16 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
         }
     }
 
+    /**
+     * 在discardConnection 方法中我们看到了调用 emptySignal方法，意味着当 activeCount< minIde的时候将会发出一个信号，这个信号的含义是：
+     * 表示空了，意思就是说连接池有空位，需要补充connection。
+     *
+     * 补充connection的方式有两种：
+     * （1）createScheduler不为null，表示存在一个专门可以创建connection的线程池，我们只需要 submitTask
+     * （2）当createScheduler为null的时候，我们会通过    createAndStartCreatorThread(); 专门启动一个线程，这个线程for(;;)
+     * CreateConnectionThread 线程中会通过信号量阻塞的方式判断是否需要创建connection
+     *
+     */
     private void emptySignal() {
         if (createScheduler == null) {
             empty.signal();

@@ -116,6 +116,75 @@ public abstract class DruidAbstractDataSource extends WrapperAdapter implements 
 
     protected volatile int                             initialSize                               = DEFAULT_INITIAL_SIZE;
     protected volatile int                             maxActive                                 = DEFAULT_MAX_ACTIVE_SIZE;
+    /**
+     * minIdle是什么意思？
+     * minIdle：连接池中的最小空闲连接数，Druid会定时扫描连接池的连接，如果空闲的连接数大于该值，则关闭多余的连接，反之则创建更多的连接以满足最小连接数要求。
+     * 为什么要设置这个参数？
+     * 设置这个参数可以应对突发流量，如果没有设置空闲连接，当有多个请求同时调用数据库，但是连接池中并没有可用连接，这时就必须创建连接，创建连接是一个非常耗时的操作，有可能会导致请求超时。
+     *
+     * minIdle是怎么起作用的？
+     * 当连接池初始化时，会初始化一个定时清除空闲连接的任务DestroyTask，该任务默认是1分钟执行一次（使用timeBetweenEvictionRunsMillis参数设置)
+     *
+     *     protected void createAndStartDestroyThread() {
+     *         destroyTask = new DestroyTask();
+     *
+     *         if (destroyScheduler != null) {
+     *             long period = timeBetweenEvictionRunsMillis;
+     *             if (period <= 0) {
+     *                 period = 1000;
+     *             }
+     *             //定时清除空闲连接的任务，默认1分钟执行一次
+     *             destroySchedulerFuture = destroyScheduler.scheduleAtFixedRate(destroyTask, period, period,
+     *                                                                           TimeUnit.MILLISECONDS);
+     *             initedLatch.countDown();
+     *             return;
+     *         }
+     *
+     *         String threadName = "Druid-ConnectionPool-Destroy-" + System.identityHashCode(this);
+     *         destroyConnectionThread = new DestroyConnectionThread(threadName);
+     *         destroyConnectionThread.start();
+     *     }
+     * 在这个定时任务中会判断连接池的连接是否满足关闭的条件，如果满足则关闭，满足的条件如下：
+     *
+     * 空闲时间大于minEvictableIdleTimeMillis（默认30分钟），并且空闲连接数大于minIdle；
+     * 空闲时间大于maxEvictableIdleTimeMillis（默认7小时）；
+     *                     //关闭条件，空闲时间大于minEvictableIdleTimeMillis，并且空闲连接大于minIdle，
+     *                     // 其中checkCount为poolingCount - minIdle，即可能被关闭的连接数量
+     *                     //或者空闲时间大于maxEvictableIdleTimeMillis
+     *                     if (idleMillis >= minEvictableIdleTimeMillis) {
+     *                         if (checkTime && i < checkCount) {
+     *                             evictConnections[evictCount++] = connection;
+     *                             continue;
+     *                         } else if (idleMillis > maxEvictableIdleTimeMillis) {
+     *                             evictConnections[evictCount++] = connection;
+     *                             continue;
+     *                         }
+     *                     }
+     * 当然也有可能这时数据库中的连接数小于minIdle这个时候就需要创建新的连接了
+     *
+     * if (keepAlive && poolingCount + activeCount < minIdle) {
+     *                 needFill = true;
+     * }
+     *
+     * if (needFill) {
+     *             lock.lock();
+     *             try {
+     *                 int fillCount = minIdle - (activeCount + poolingCount + createTaskCount);
+     *                 for (int i = 0; i < fillCount; ++i) {
+     *                     //通知CreateConnectionTask创建连接
+     *                     emptySignal();
+     *                 }
+     *             } finally {
+     *                 lock.unlock();
+     *             }
+     * 总结
+     * minIdle的意义是预防突发流量；
+     *
+     * 另外在 discardConnection 方法中用于关闭一个connection，关闭之后我们会判断 activeCount是否小于minIde ，如果小于
+     * 则会创建新的connection
+     *
+     *
+     */
     protected volatile int                             minIdle                                   = DEFAULT_MIN_IDLE;//最小空闲
     protected volatile int                             maxIdle                                   = DEFAULT_MAX_IDLE;//最大空闲
     protected volatile long                            maxWait                                   = DEFAULT_MAX_WAIT;
@@ -294,8 +363,21 @@ public abstract class DruidAbstractDataSource extends WrapperAdapter implements 
     protected boolean                                  isMySql                                   = false;
     protected boolean                                  useOracleImplicitCache                    = true;
 
+    /**
+     * 对所有volatile类型的变量的修改都 使用lock.lock 来获取锁
+     */
     protected ReentrantLock                            lock;
+    /**
+     * notEmpty： 表示不为空。 当连接池为空的时候我们 会调用notEmpty的await方法阻塞当前线程，这发生在getConnection的时候。
+     * 当连接池不为空的时候，也就是CreateConnectionThread创建了连接放置到了连接池中或者其他线程归还了连接，这个时候我们会调用 notEmpty的signal方法 发出信号通知。
+     * 因此条件成立的时候signal，条件不成立的时候await
+     */
     protected Condition                                notEmpty;
+    /**
+     * Empty:连接池为空。 条件不成立时：连接池不为空，则调用empty的await方法，阻塞当前线程， 一般会用在CreateConnectionThread线程中， 当连接池不为空的时候我们不需要创建connection
+     *
+     * 条件成立时： 连接池为空，我们调用empty的signal方法 发出通知，  这个时候连接池为空，连接池内没有可用连接， CreateConnectionThread可以被唤醒创建新的链接。
+     */
     protected Condition                                empty;
 
     /**
@@ -330,7 +412,7 @@ public abstract class DruidAbstractDataSource extends WrapperAdapter implements 
     protected volatile int                             failContinuous                            = 0;
     protected volatile long                            failContinuousTimeMillis                  = 0L;
     protected ScheduledExecutorService                 destroyScheduler;
-    //https://github.com/alibaba/druid/issues/1758
+    //https://github.com/alibaba/druid/issues/1758 ：datasource close之后，createScheduler线程池还在后台创建连接 #
     protected ScheduledExecutorService                 createScheduler;
 
     final static AtomicLongFieldUpdater<DruidAbstractDataSource> failContinuousTimeMillisUpdater = AtomicLongFieldUpdater.newUpdater(DruidAbstractDataSource.class, "failContinuousTimeMillis");
@@ -1713,6 +1795,9 @@ public abstract class DruidAbstractDataSource extends WrapperAdapter implements 
 
     public Connection createPhysicalConnection(String url, Properties info) throws SQLException {
         Connection conn;
+        /**
+         * 从这里我们看到 Druid DataSource中对Connection的创建最终还是getDriver.connect 也就是使用了 java.sql.Driver 类中的connect API
+         */
         if (getProxyFilters().size() == 0) {
             conn = getDriver().connect(url, info);
         } else {
@@ -1812,6 +1897,8 @@ public abstract class DruidAbstractDataSource extends WrapperAdapter implements 
         createStartNanosUpdater.set(this, connectStartNanos);
         creatingCountUpdater.incrementAndGet(this);
         try {
+            //这里创建了Connecton  然后在最后又将Connection放置到了 PhysicalConnectionInfo 中，这里并没有放置到 连接池connections中
+            //因为连接池中存放的是 DruidConnectionHolder  ，也就是定义是 DruidConnectionHolder[] connections
             conn = createPhysicalConnection(url, physicalConnectProperties);
             connectedNanos = System.nanoTime();
 
