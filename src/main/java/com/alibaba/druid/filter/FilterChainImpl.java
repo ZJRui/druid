@@ -177,6 +177,78 @@ public class FilterChainImpl implements FilterChain {
 
         /**
          * 使用Driver获取connection。 在MySQL中驱动就是com.mysql.cj.jdbc.Driver， connection就是ConnectionImpl
+         *
+         *
+         * 注意这里 获取最底层的connection
+         *
+         * <init>:61, ConnectionProxyImpl (com.alibaba.druid.proxy.jdbc), ConnectionProxyImpl.java
+         * connection_connect:162, FilterChainImpl (com.alibaba.druid.filter), FilterChainImpl.java
+         * connection_connect:787, FilterAdapter (com.alibaba.druid.filter), FilterAdapter.java
+         * connection_connect:38, FilterEventAdapter (com.alibaba.druid.filter), FilterEventAdapter.java
+         * connection_connect:150, FilterChainImpl (com.alibaba.druid.filter), FilterChainImpl.java
+         * connection_connect:207, Catdatalog (com.bingkun.kingkong.log), Catdatalog.java
+         * connection_connect:150, FilterChainImpl (com.alibaba.druid.filter), FilterChainImpl.java
+         * createPhysicalConnection:1646, DruidAbstractDataSource (com.alibaba.druid.pool), DruidAbstractDataSource.java
+         * createPhysicalConnection:1710, DruidAbstractDataSource (com.alibaba.druid.pool), DruidAbstractDataSource.java
+         * getConnectionInternal:1573, DruidDataSource (com.alibaba.druid.pool), DruidDataSource.java
+         * getConnectionDirect:1404, DruidDataSource (com.alibaba.druid.pool), DruidDataSource.java
+         * dataSource_connect:5059, FilterChainImpl (com.alibaba.druid.filter), FilterChainImpl.java
+         * dataSource_getConnection:886, LogFilter (com.alibaba.druid.filter.logging), LogFilter.java
+         * dataSource_connect:5055, FilterChainImpl (com.alibaba.druid.filter), FilterChainImpl.java
+         * dataSource_getConnection:694, Catdatalog (com.bingkun.kingkong.log), Catdatalog.java
+         * dataSource_connect:5055, FilterChainImpl (com.alibaba.druid.filter), FilterChainImpl.java
+         * getConnection:1382, DruidDataSource (com.alibaba.druid.pool), DruidDataSource.java
+         * getConnection:1374, DruidDataSource (com.alibaba.druid.pool), DruidDataSource.java
+         * getConnection:98, DruidDataSource (com.alibaba.druid.pool), DruidDataSource.java
+         * getConnection:141, RoutingDataSource (com.bingkun.kingkong.model.base.dal), RoutingDataSource.java
+         * fetchConnection:151, DataSourceUtils (org.springframework.jdbc.datasource), DataSourceUtils.java
+         * doGetConnection:115, DataSourceUtils (org.springframework.jdbc.datasource), DataSourceUtils.java
+         * getConnection:78, DataSourceUtils (org.springframework.jdbc.datasource), DataSourceUtils.java
+         * execute:600, JdbcTemplate (org.springframework.jdbc.core), JdbcTemplate.java
+         * query:657, JdbcTemplate (org.springframework.jdbc.core), JdbcTemplate.java
+         * query:688, JdbcTemplate (org.springframework.jdbc.core), JdbcTemplate.java
+         * query:700, JdbcTemplate (org.springframework.jdbc.core), JdbcTemplate.java
+         * query:756, JdbcTemplate (org.springframework.jdbc.core), JdbcTemplate.java
+         * getSObjectType:139, SObjectTypeDaoImpl (com.bingkun.kingkong.model.meta.dao.impl), SObjectTypeDaoImpl.java
+         * load:60, SObjectTypeCacheLoaderImpl (com.bingkun.kingkong.cache.loader.impl), SObjectTypeCacheLoaderImpl.java
+         * loadObjectFromDB:140, MemoryCacheKingKongCacheImpl (com.bingkun.kingkong.cache.service.local), MemoryCacheKingKongCacheImpl.java
+         * get:97, MemoryCacheKingKongCacheImpl (com.bingkun.kingkong.cache.service.local), MemoryCacheKingKongCacheImpl.java
+         * get:60, CompositeKingKongCacheImpl (com.bingkun.kingkong.cache.service.composite), CompositeKingKongCacheImpl.java
+         * getSObjectType:448, BmfAggrModelManagerImpl (com.bingkun.kingkong.model.meta.service.impl), BmfAggrModelManagerImpl.java
+         * initBmfTable:1058, SObjectManagerImpl (com.bingkun.kingkong.model.meta.service.impl), SObjectManagerImpl.java
+         * findAll:234, TObjectFacadeServiceImpl (com.bingkun.kingkong.sdk.service.impl), TObjectFacadeServiceImpl.java
+         * invoke:-1, TObjectFacadeServiceImpl$$FastClassBySpringCGLIB$$1 (com.bingkun.kingkong.sdk.service.impl), <generated>
+         * invoke:204, MethodProxy (org.springframework.cglib.proxy), MethodProxy.java
+         * intercept:684, CglibAopProxy$DynamicAdvisedInterceptor (org.springframework.aop.framework), CglibAopProxy.java
+         * findAll:-1, TObjectFacadeServiceImpl$$EnhancerBySpringCGLIB$$1 (com.bingkun.kingkong.sdk.service.impl), <generated>
+         * loadTenantRuleFromDB:217, SentinelServiceImpl (com.bingkun.kingkong.model.sentinel.service), SentinelServiceImpl.java
+         * loadTenantRules:154, SentinelServiceImpl (com.bingkun.kingkong.model.sentinel.service), SentinelServiceImpl.java
+         * onMessage:22, DegradeRulesReloadHandler (com.bingkun.kingkong.cache.message.handler), DegradeRulesReloadHandler.java
+         * handleMessage:136, CommonMsgListener (com.bingkun.kingkong.model.rocketMQ), CommonMsgListener.java
+         * handleMessage:120, CommonMsgListener (com.bingkun.kingkong.model.rocketMQ), CommonMsgListener.java
+         * onMessage:84, CommonMsgListener (com.bingkun.kingkong.model.rocketMQ), CommonMsgListener.java
+         * lambda$createConsumer$0:86, InnerConsumerFactoryImpl (com.bingkun.kingkong.model.rocketMQ.consumer), InnerConsumerFactoryImpl.java
+         * consumeMessage:-1, 1077958045 (com.bingkun.kingkong.model.rocketMQ.consumer.InnerConsumerFactoryImpl$$Lambda$381), Unknown Source
+         * run:417, ConsumeMessageConcurrentlyService$ConsumeRequest (org.apache.rocketmq.client.impl.consumer), ConsumeMessageConcurrentlyService.java
+         * call:511, Executors$RunnableAdapter (java.util.concurrent), Executors.java
+         * run:266, FutureTask (java.util.concurrent), FutureTask.java
+         * runWorker:1149, ThreadPoolExecutor (java.util.concurrent), ThreadPoolExecutor.java
+         * run:624, ThreadPoolExecutor$Worker (java.util.concurrent), ThreadPoolExecutor.java
+         * run:748, Thread (java.lang), Thread.java
+         *
+         *
+         * 我想表达的意思是： 当我们不使用druid的时候我们使用的connection就是Mysql驱动中的Connection，但是当我们使用Druid 的时候使用的connection就是Druid的Connection
+         * 这是怎么实现无缝切换的？ 这是因为我们通过DruidDataSource的getConnection来获取的Connection，这种方式获取到的connection就是Druid的
+         *
+         * jdbc驱动内的DataSource是 com.mysql.cj.jdbc.MysqlDataSource 的getConnection就是直接通过 mysqlDriver.connect(jdbcUrlToUse, props); 返回MySql驱动的Connection实现。
+         *
+         * 因此切入点是DruidDataSource的getConnection返回的是Druid的ConnectionProxyImpl， 具体体现在FilterChainImpl的connection_connect最后一行代码
+         *
+         *
+         *
+         * 通过ConnectionProxyImpl的createStatement方法又返回Druid的Statement： StatementProxyImpl，具体体现在com.alibaba.druid.filter.FilterChainImpl#connection_createStatement(com.alibaba.druid.proxy.jdbc.ConnectionProxy)
+         *
+         *
          */
         Connection nativeConnection = driver.connect(url, info);
 

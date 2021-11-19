@@ -47,6 +47,7 @@ public final class DruidConnectionHolder {
 
     protected final DruidAbstractDataSource       dataSource;
     protected final long                          connectionId;
+    //持有的Connection
     protected final Connection                    conn;
     protected final List<ConnectionEventListener> connectionEventListeners = new CopyOnWriteArrayList<ConnectionEventListener>();
     protected final List<StatementEventListener>  statementEventListeners  = new CopyOnWriteArrayList<StatementEventListener>();

@@ -116,13 +116,30 @@ public abstract class DruidAbstractDataSource extends WrapperAdapter implements 
 
     protected volatile int                             initialSize                               = DEFAULT_INITIAL_SIZE;
     protected volatile int                             maxActive                                 = DEFAULT_MAX_ACTIVE_SIZE;
-    protected volatile int                             minIdle                                   = DEFAULT_MIN_IDLE;
-    protected volatile int                             maxIdle                                   = DEFAULT_MAX_IDLE;
+    protected volatile int                             minIdle                                   = DEFAULT_MIN_IDLE;//最小空闲
+    protected volatile int                             maxIdle                                   = DEFAULT_MAX_IDLE;//最大空闲
     protected volatile long                            maxWait                                   = DEFAULT_MAX_WAIT;
     protected int                                      notFullTimeoutRetryCount                  = 0;
 
     protected volatile String                          validationQuery                           = DEFAULT_VALIDATION_QUERY;
     protected volatile int                             validationQueryTimeout                    = -1;
+    /**
+     * testOnBorrow含义
+     * testOnBorrow：如果为true（默认为false），当应用向连接池申请连接时，连接池会判断这条连接是否是可用的。
+     *
+     * testOnBorrow=false可能导致问题
+     * 假如连接池中的连接被数据库关闭了，应用通过连接池ge tConnection时，都可能获取到这些不可用的连接，且这些连接如果不被其他线程回收的话；它们不会被连接池废除，也不会重新被创建，占用了连接池的名额，项目如果是服务端，数据库链接被关闭，客户端调用服务端就会出现大量的timeout，客户端设置了超时时间，会主动断开，服务端就会出现close_wait。
+     *
+     * 连接池如何判断连接是否有效的？
+     * 常用数据库：使用${DBNAME}ValidConnectionChecker进行判断，比如Mysql数据库，使用MySqlValidConnectionChecker的isValidConnection进行判断
+     * 其他数据库：则使用validationQuery判断
+     * 验证不通过则会直接关闭连接，并重新从连接池获取下一条连接。
+     * 总结
+     * 1.testOnBorrow能够确保我们每次都能获取到可用的连接，但是如果设置为true，则每次获取连接时候都要到数据库验证连接有效性，这在高并发的时候会造成性能下降，可以将testOnBorrow设置成false，testWhileIdle设置成true这样能获得比较好的性能。
+     *
+     * 2.testOnBorrow和testOnReturn在生产环境一般是不开启的，主要是性能考虑。失效连接主要通过testWhileIdle保证，如果获取到了不可用的数据库连接，一般由应用处理异常。
+     *
+     */
     protected volatile boolean                         testOnBorrow                              = DEFAULT_TEST_ON_BORROW;
     protected volatile boolean                         testOnReturn                              = DEFAULT_TEST_ON_RETURN;
     protected volatile boolean                         testWhileIdle                             = DEFAULT_WHILE_IDLE;
@@ -157,6 +174,20 @@ public abstract class DruidAbstractDataSource extends WrapperAdapter implements 
     protected volatile long                            phyTimeoutMillis                          = DEFAULT_PHY_TIMEOUT_MILLIS;
     protected volatile long                            phyMaxUseCount                            = -1;
 
+    /**
+     * removeAbandoned 含义和使用
+     *
+     * 原名：使用druid连接池的超时回收机制排查连接泄露问题
+     *
+     * 总结:
+     *
+     *  含义: 是否开启自动清理被租借的连接但是又没有还回线程池
+     *
+     *  作用:
+     *          1.租借的时候放入activeConnections
+     *
+     *          2.DyestroyTask定时把没有放回连接池的连接关闭掉
+     */
     protected volatile boolean                         removeAbandoned;
     protected volatile long                            removeAbandonedTimeoutMillis              = 300 * 1000;
     protected volatile boolean                         logAbandoned;
@@ -171,6 +202,30 @@ public abstract class DruidAbstractDataSource extends WrapperAdapter implements 
 
     protected volatile ValidConnectionChecker          validConnectionChecker                    = null;
 
+    /**
+     * 对activeConnections的修改需要 先使用activeConnectionLock来获取到锁，然后才能修改，不仅是修改activeConnections需要获取锁。
+     * 比如在getActiveConnections方法中，我们需要获取activeConnections的key，这个时候 也会加锁。
+     *
+     * 问题： 1，为什么这里不使用并发hashMap
+     * 2，IdentityHashMap 有什么特点
+     *
+     *
+     * HashMap
+     * 对于常用的HashMap来说，我们都知道只要key的值相同（严谨说法是：key.equals(k)） 那么我们认为他们是同一个可以Entry。如果我们把颜色作为研究对象：key值，那么我们就得出双胞胎兄弟的颜色一致，key.equals(k)=true，他们是同一个人（脸盲症）。
+     *
+     * JDK源码：
+     *if (e.hash == hash && ((k = e.key) == key || key.equals(k)))
+     *
+     * IdentityHashMap
+     * 而对于IdentityHashMap则不同，他是非分明，他只承认key==e.key的结果为true时，才认为是相同的Entry。不管双胞胎弟弟今天穿绿色，明天穿蓝色，他都认为你是同一个人，不会“脸盲”。
+     *  if (item == k)
+     *
+     *
+     *　查看JDK源码总是能发现一些新东西，IdentityHashMap也是Map的一个子类，其也是一个有特性的Map。一样是通过Hash表的方法实现了Map接口，
+     * 但是其比较键值是否相等的时候，并没有使用compare方法，而是使用是否是同一个引用来判断。所以k1和k2只有完全是同一个的时候才会相等k1==k2(通常是都不为null时k1.equals(k2)来判断)。
+     *
+     *
+     */
     protected final Map<DruidPooledConnection, Object> activeConnections                         = new IdentityHashMap<DruidPooledConnection, Object>();
     protected final static Object                      PRESENT                                   = new Object();
 
@@ -243,6 +298,10 @@ public abstract class DruidAbstractDataSource extends WrapperAdapter implements 
     protected Condition                                notEmpty;
     protected Condition                                empty;
 
+    /**
+     * 这个锁主要是配合activeConnections 来使用的，当我们修改 activeConnections的时候首先要通过activeConnectionLock来获取到锁
+     *
+     */
     protected ReentrantLock                            activeConnectionLock                      = new ReentrantLock();
 
     protected volatile int                             createErrorCount                          = 0;
@@ -271,6 +330,7 @@ public abstract class DruidAbstractDataSource extends WrapperAdapter implements 
     protected volatile int                             failContinuous                            = 0;
     protected volatile long                            failContinuousTimeMillis                  = 0L;
     protected ScheduledExecutorService                 destroyScheduler;
+    //https://github.com/alibaba/druid/issues/1758
     protected ScheduledExecutorService                 createScheduler;
 
     final static AtomicLongFieldUpdater<DruidAbstractDataSource> failContinuousTimeMillisUpdater = AtomicLongFieldUpdater.newUpdater(DruidAbstractDataSource.class, "failContinuousTimeMillis");
@@ -1707,6 +1767,38 @@ public abstract class DruidAbstractDataSource extends WrapperAdapter implements 
 
         Connection conn = null;
 
+        /**
+         * nanoTime更细更精确,可用于线程中,currentTimeMillis可用来计算当前日期(精确到毫秒)，星期几等，可以方便的与Date进行转换,用的时候根据需要取之.
+         *
+         * System.nanoTime的介绍
+         * public static long nanoTime()： 返回最准确的可用于系统计时的时间值，以毫微秒即纳秒为单位。
+         *
+         * 此方法只能用于测量已过去的时间，与系统或钟表时间表示的时间概念无关。
+         * 返回值表示从某一固定但任意的时间开始计算的毫微秒数（也可以从将来某一时刻算起，所以该值可能为负值）。此方法提供毫微秒的精度，但不是必要的毫微秒的准确度。它对于值的更改频率没有作出保证。
+         * 在取值范围大于约 292 年的连续调用时，会由于数字溢出，将无法准确计算已过的时间（Long最大值9223372036854775807，该数量的纳秒即9223372036秒，约为292年）。
+         *
+         * 例如，测试某些代码执行的时间长度：
+         *
+         * //由于选取比较的时间点任意，startTime每次都不同
+         *
+         * long startTime = System.nanoTime();
+         * System.out.println(startTime);      //171258913345100
+         * long duringTime = System.nanoTime() - startTime;
+         * System.out.println(duringTime);     //421500
+
+         * System.currentTimeMillis的介绍
+         * public static long currentTimeMillis()： 返回以毫秒为单位的当前时间。
+         *
+         * System.currentTimeMillis返回的是从1970.01.01 零点开始到现在的时间，精确到毫秒，我们也可以根据System.currentTimeMillis来计算当前日期、星期几等，可以方便的与Date进行转换。
+         *
+         * //时间戳转String日期
+         * SimpleDateFormat dateformat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+         * String dateStr = dateformat.format(System.currentTimeMillis());
+         *
+         * //String日期转时间戳
+         * SimpleDateFormat dateformat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+         * long time = dateformat.parse("2016-09-02 23:02:17").getTime();
+         */
         long connectStartNanos = System.nanoTime();
         long connectedNanos, initedNanos, validatedNanos;
 
@@ -2014,6 +2106,15 @@ public abstract class DruidAbstractDataSource extends WrapperAdapter implements 
         decrementCachedPreparedStatementCount();
         incrementCachedPreparedStatementDeleteCount();
 
+        /**
+         * 问题： JDBC中的Statement是对什么的抽象？ 为什么Statement 可以被关闭，也就是close
+         * 我们一般不都是connection.close吗？
+         *
+         * 在com.mysql.cj.jdbc.StatementImpl的close方法中实际调用了com.mysql.cj.jdbc.StatementImpl#realClose(boolean, boolean)
+         * 在这个realClose方法中 首先从connection中unregisterStatement
+         * statement中有一个属性    protected ResultSetInternalMethods results = null;   这个类其实是JDBC的驱动ResultSetImpl
+         * statement的close会调用ResultSetImpl的close
+         */
         JdbcUtils.close(stmtHolder.statement);
     }
 

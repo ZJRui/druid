@@ -57,6 +57,8 @@ public class LogFactory {
 
     @SuppressWarnings("unchecked")
     private static void tryImplementation(String testClassName, String implClassName) {
+        //在上面的static代码块中我们多次调用了tryImplementation，当第一次tryImplementation 执行的是时候会给logConstructor赋值，因此后续的tryImplementation发现前面的try已经设置了logConstructor，则
+        //后面就不需要执行tryImplementation了
         if (logConstructor != null) {
             return;
         }

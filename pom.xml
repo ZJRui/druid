@@ -708,6 +708,11 @@
 			<scope>system</scope>
 			<systemPath>${project.basedir}/lib/openjdk-1.8-jconsole.jar</systemPath>
 		</dependency>
+		<dependency>
+			<groupId>org.projectlombok</groupId>
+			<artifactId>lombok</artifactId>
+			<version>1.18.20</version>
+		</dependency>
 
 		<dependency>
 			<groupId>org.apache.curator</groupId>

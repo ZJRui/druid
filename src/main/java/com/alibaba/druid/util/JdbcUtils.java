@@ -72,6 +72,11 @@ public final class JdbcUtils implements JdbcConstants {
         }
     }
 
+    /**
+     * Druid 中对connection进行了包装 ，这里的Connection实际上是ConnectionProxyImpl
+     * 在这个ConnectionProxyImpl中存在属性 Connection  connection，这个属性本质上是mysql驱动的 com.mysql.cj.jdbc.ConnectionImpl
+     * @param x
+     */
     public static void close(Connection x) {
         if (x == null) {
             return;
