@@ -23,6 +23,7 @@ import com.alibaba.druid.util.JdbcUtils;
 import com.alibaba.druid.util.StringUtils;
 import com.alibaba.druid.util.Utils;
 import com.ibatis.sqlmap.engine.mapping.sql.Sql;
+import org.apache.ibatis.jdbc.SQL;
 
 import javax.management.MBeanRegistration;
 import javax.management.MBeanServer;
@@ -950,6 +951,54 @@ public class MyDruidDataSource extends DruidAbstractDataSource  implements Druid
 
     }
 
+    DruidConnectionHolder takeLast() throws  InterruptedException ,SQLException {
+
+        try {
+            while (poolingCount == 0) {
+                //发出signal信号通知CreateThread创建connection
+                emptySignal();
+
+                if (failFast && isFailContinuous()) {
+                    throw new DataSourceNotAvailableException(createError);
+                }
+
+                //等待获取connection的线程数量++
+                notEmptyWaitThreadCount++;
+                if (notEmptyWaitThreadCount > notEmptyWaitThreadPeak) {
+                    notEmptyWaitThreadPeak = notEmptyWaitThreadCount;
+                }
+                try {
+                    //阻塞当前线程，等待有可用的connection
+                    notEmpty.await();
+
+                } finally {
+                    notEmptyWaitThreadCount--;
+                }
+
+                notEmptyWaitCount++;
+
+                if (!enable) {
+                    connectErrorCountUpdater.incrementAndGet(this);
+                    if (disableException != null) {
+                        throw disableException;
+                    }
+
+                    throw new DataSourceDisableException();
+                }
+
+
+            }//end while
+        } catch (InterruptedException interruptedException) {
+            notEmpty.signal();
+            notEmptySignalCount++;
+            throw interruptedException;
+        }
+        decrementPoolingCount();
+        DruidConnectionHolder last = connections[poolingCount];
+        connections[poolingCount] = null;
+        return last;
+    }
+
 
     private final void decrementPoolingCount() {
         poolingCount--;
@@ -1186,7 +1235,7 @@ public class MyDruidDataSource extends DruidAbstractDataSource  implements Druid
                 throw new SQLException("interrupt", e);
             }
             //获取锁成功
-            try{
+            try {
                 if (maxWaitThreadCount > 0 && notEmptyWaitThreadCount >= maxWaitThreadCount) {
                     connectErrorCountUpdater.incrementAndGet(this);
                     //lock
@@ -1229,16 +1278,30 @@ public class MyDruidDataSource extends DruidAbstractDataSource  implements Druid
                 }
                 if (maxWaitMillis > 0) {
                     holder = pollLast(naos);
-                }else{
+                } else {
                     holder = taskLast();
                 }
 
 
+            } catch (InterruptedException interruptedException) {
+                connectErrorCountUpdater.incrementAndGet(this);
+                throw new SQLException(interruptedException.getMessage(), interruptedException);
+            } catch (SQLException sqlException) {
+
+                connectErrorCountUpdater.incrementAndGet(this);
+                throw sqlException;
+
+            }finally{
+                lock.unlock();
+
             }
 
-
-
+            break;
         }//end for
+
+
+
+
     }
 
     public void init() throws SQLException {

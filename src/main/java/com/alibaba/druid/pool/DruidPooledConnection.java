@@ -61,6 +61,9 @@ public class DruidPooledConnection extends PoolableWrapper implements javax.sql.
     protected volatile   DruidConnectionHolder holder;
     protected            TransactionInfo       transactionInfo;
     private final        boolean               dupCloseLogEnable;
+    /**
+     * 被removeAbandoned的链接设置为false
+     */
     protected volatile   boolean               traceEnable          = false;
     private   volatile   boolean               disable              = false;
     protected volatile   boolean               closed               = false;
@@ -310,6 +313,11 @@ public class DruidPooledConnection extends PoolableWrapper implements javax.sql.
             List<Filter> filters = dataSource.getProxyFilters();
             if (filters.size() > 0) {
                 FilterChainImpl filterChain = new FilterChainImpl(dataSource);
+                /**
+                 *
+                 * 注意在FilterChainImpl的 dataSource_recycle方法的最后 会调用 connection.recycle();
+                 * 将连接进行回收
+                 */
                 filterChain.dataSource_recycle(this);
             } else {
                 recycle();
@@ -336,6 +344,10 @@ public class DruidPooledConnection extends PoolableWrapper implements javax.sql.
         }
 
         if (!this.abandoned) {
+            /**
+             * DruidPooledConnection的 回收 方法recycle 最终还是交给了 DataSource的recycle方法
+             *
+             */
             DruidAbstractDataSource dataSource = holder.getDataSource();
             dataSource.recycle(this);
         }
@@ -739,6 +751,9 @@ public class DruidPooledConnection extends PoolableWrapper implements javax.sql.
             holder.setLastExecTimeMillis(System.currentTimeMillis());
         }
 
+        /**
+         * autoCommit为false 设置为不自动提交
+         */
         if (transactionInfo == null && (!conn.getAutoCommit())) {
             DruidAbstractDataSource dataSource = holder.getDataSource();
             dataSource.incrementStartTransactionCount();
@@ -1237,6 +1252,10 @@ public class DruidPooledConnection extends PoolableWrapper implements javax.sql.
 
     final void beforeExecute() {
         final DruidConnectionHolder holder = this.holder;
+        /**
+         * todo  为什么需要判断removeAbandoned之后才将属性running设置为true
+         *
+         */
         if (holder != null && holder.dataSource.removeAbandoned) {
             running = true;
         }
@@ -1246,6 +1265,13 @@ public class DruidPooledConnection extends PoolableWrapper implements javax.sql.
         final DruidConnectionHolder holder = this.holder;
         if (holder != null) {
             DruidAbstractDataSource dataSource = holder.dataSource;
+            /**
+             * todo  为什么removeAbandoned为true的情况下才会 记录running？
+             *
+             * 原因是： 在DestroyTask的run方法中 会调用 DruidDataSource的removeAbandoned方法，在这个removeAbandoned方法中
+             * 会遍历activeConnections 中的每一个DruidPooledConnection，然后判断这个connection是否isRunning，如果是isRunning
+             * 则不会对该Connection进行close
+             */
             if (dataSource.removeAbandoned) {
                 running = false;
                 holder.lastActiveTimeMillis = System.currentTimeMillis();

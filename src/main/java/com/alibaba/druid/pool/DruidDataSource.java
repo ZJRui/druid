@@ -135,13 +135,20 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
     //poolingPeak":50 //池的最高峰数量
     //"activeCount":0, //activeCount 是当前正在被使用的连接数量，这部分已经被用户拿去使用还没归还。poolingCount + activeCount 的数量才是 druid 拥有的所有连接数量。
     //"activePeak":47 //activeCount正在使用的连接数量，peak是activeCount的峰值
-    private int                              poolingCount              = 0;
-    private int                              activeCount               = 0;
+    private int                              poolingCount              = 0;//当前连接池中可用数量
+    private int                              activeCount               = 0;//被使用中的连接数量
     private volatile long                    discardCount              = 0;
     private int                              notEmptyWaitThreadCount   = 0;
     private int                              notEmptyWaitThreadPeak    = 0;
     //evict : vt. 驱逐；逐出
+    /**
+     * evictConnections中的连接会从connections中移除，并且使用JdbcUtils.close()  关闭连接
+     */
     private DruidConnectionHolder[]          evictConnections;
+    /**
+     * 对keepAliveConnections中的连接进行连接可用性检测（validateConnection方法进行检查，创建物理连接后也是使用该方法检查连接）。
+     * 检测通过之后，继续使用该连接（采用的是先移除，检测通过再放入的方式），否则使用JdbcUtils.close()  关闭连接。
+     */
     private DruidConnectionHolder[]          keepAliveConnections;
 
     // threads
@@ -748,6 +755,9 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
 
         lock.lock();
         try {
+            /**
+             * 这里就体现了 连接的数量： poolingCount 表示连接池中可用连接的数量， activeCount表示已经分配给线程的 线程尚未归还的链接的数量
+             */
             int allCount = this.poolingCount + this.activeCount;
 
             if (maxActive > allCount) {
@@ -1478,6 +1488,7 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
                  * 如果testOnBorrow为true，则会检测connection的可用性
                  *
                  * TestOnBorrow=false时，由于不检测池里连接的可用性，于是假如连接池中的连接被数据库关闭了，应用通过连接池getConnection时，都可能获取到这些不可用的连接，且这些连接如果不被其他线程回收的话，它们不会被连接池被废除，也不会重新被创建，占用了连接池的名额。
+                 *  // 这里会去调用validConnectionChecker的isValidConnection方法来校验，validConnectionChecker不存在的话，则以普通JDBC方式校验
                  */
                 boolean validate = testConnectionInternal(poolableConnection.holder, poolableConnection.conn);
                 if (!validate) {
@@ -1485,6 +1496,7 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
                         LOG.debug("skip not validate connection.");
                     }
 
+                    //丢弃连接，丢弃完会发送signal给CreateConnectionthread来创建连接。
                     discardConnection(poolableConnection.holder);
                     continue;
                 }
@@ -1550,8 +1562,26 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
 
             /**
              * removeAbandoned：开启连接超时回收机制，也就是说当连接长时间未被归还的时候 主动清理该连接
+             *
+             * 如果设置了removeAbandoned，则会将连接对象放入activeConnections；
+             *
+             * 使用这个状态可以在获取连接的时候，将连接放入到activeConnections中。在Destroytask中会执行removeAbandoned方法，对activeConnections中的 连接进行
+             * 连接泄漏检测。
              */
             if (removeAbandoned) {
+                /**
+                 *      *
+                 *      * ## 主动回收连接、放置内存泄漏
+                 *      *
+                 *      * 这个流程是在removeAbandoned设置为true的情况下才会触发，用于回收那些拿出去的使用长期未归还（归还：调用close方法触发主流程）的链接。
+                 *      *
+                 *      * 先来看看activeConnections是什么,activeConnectoins用来保存当前从池子中被借出去的链接， 每次调用getConnection时，如果开启removeAbandoned，则会把
+                 *      * 连接对象放到activeConnections，然后如果长期不调用close，那么这个被借出去的链接将永远无法被重新放回池子，这是一件很麻烦的事情， 这将存在内存泄漏的风险，因为不close，意味着池子
+                 *      * 会不断产生新的链接放进connections，不符合连接池预期（连接池触发点是尽可能减少的创建连接），然后之前被借出去的连接对象还有一只无法被回收的风险，存在内存泄漏的风险，因此为了解决这个问题，就有了将现在
+                 *      * 借出去还未归还的链接 做一次判断， 符合条件的将会被放置到abandonedList进行连接回收（这个list中的连接对象的abandoned将会被设置为true，标记已被处理过）
+                 *      *
+                 *      * 这个如果在实践中能保证每次都可以正常close，完全不用设置removeAbandoned=true，目前如果使用了类似mybatis spring等开源框架，框架内部是一定会close的，所以此项不建议设置，视情况而定
+                 */
                 //记录获取连接时的堆栈
                 StackTraceElement[] stackTrace = Thread.currentThread().getStackTrace();
                 poolableConnection.connectStackTrace = stackTrace;
@@ -1625,6 +1655,9 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
             holder.discard = true;
 
             if (activeCount <= minIdle) {
+                //emptysignal方法中 会empty.signal 通知唤醒CreateConnectionThread线程来创建Connection
+                //empty 和notEmpty都是condition对象， 调用Condition对象的await或者signal方法 都需要先获取到Condition对象关联的ReentrantLock
+                //lock对象上的锁，因此 上面先进行了lock.lock
                 emptySignal();
             }
         } finally {
@@ -1652,6 +1685,7 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
             throw new DataSourceClosedException("dataSource already closed at " + new Date(closeTimeMillis));
         }
 
+        //enable 默认为true，close的时候置为false
         if (!enable) {
             connectErrorCountUpdater.incrementAndGet(this);
 
@@ -1668,13 +1702,16 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
         DruidConnectionHolder holder;
 
         for (boolean createDirect = false;;) {
+            /**
+             * Q:什么情况下是直接创建？
+             */
             if (createDirect) {
                 createStartNanosUpdater.set(this, System.nanoTime());
                 //期望是0， 将其更新为1，为什么期望creatingCountUpdater是0呢？ 因为在下面的代码中，createPhysical前后 compareAndSet
                 // 然后 decrementAndGet 也就是说compareAndSet更新为1之后 创建连接之后decrementAndGet 将其设置为0
                 //从这里我们可以看到 并发时刻只会有一个线程 createPhysicalConnection
                 if (creatingCountUpdater.compareAndSet(this, 0, 1)) {
-                    //创建物理连接
+                    //创建物理连接, 注意这里创建的连接被包装成DruidConnectionHolder之后并没有放置到连接池中，而是返回出去了
                     PhysicalConnectionInfo pyConnInfo = DruidDataSource.this.createPhysicalConnection();
 
                     //Druid的连接池定义是 DruidConnectionHolder[] connections，也就是连接池中存放的是DruidConnectionHolder，  上面创建的是PhysicalConnectionInfo
@@ -1712,9 +1749,13 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
                     }
                 }// cas失败了
 
-            }
+            }//end if createDirect
 
             try {
+                /**
+                 *
+                 *这里加锁，保证同一个时刻 只会有一个线程能够 从线程池 中通过使用pollLast或者takeLast取出 连接。
+                 */
                 lock.lockInterruptibly();
             } catch (InterruptedException e) {
                 connectErrorCountUpdater.incrementAndGet(this);
@@ -1745,6 +1786,9 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
                             + lock.getQueueLength());
                 }
 
+                /**
+                 * onFatalError 表示DataSource遇到了严重的错误。
+                 */
                 if (onFatalError
                         && onFatalErrorMaxActive > 0
                         && activeCount >= onFatalErrorMaxActive) {
@@ -1788,6 +1832,11 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
                     }
                 }
 
+                /**
+                 * 問題： 如果createDirect为true上面会直接执行createPhysicalConnection 创建一个连接，被包装成DruidConnectionHolder，
+                 * 为什么这里还要执行pollLast 或者takeLast，这不会导致 之前创建的holder被丢弃吗？
+                 *
+                 */
                 if (maxWait > 0) {
                     holder = pollLast(nanos);
                 } else {
@@ -1871,6 +1920,8 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
         DruidPooledConnection poolalbeConnection = new DruidPooledConnection(holder);
         return poolalbeConnection;
     }
+
+
 
     public void handleConnectionException(DruidPooledConnection pooledConnection, Throwable t, String sql) throws SQLException {
         final DruidConnectionHolder holder = pooledConnection.getConnectionHolder();
@@ -1977,6 +2028,16 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
 
     /**
      * 回收连接
+     *
+     * 什么时候对连接进行回收？
+     *
+     * 是在DruidPooledConnection进行close的时候对connection进行回收
+     *
+     * DruidPooledConnection.recycle()  (com.alibaba.druid.pool)
+     *     DruidPooledConnection.syncClose()  (com.alibaba.druid.pool)
+     *         DruidPooledConnection.close()  (com.alibaba.druid.pool)
+     *
+     *
      */
     protected void recycle(DruidPooledConnection pooledConnection) throws SQLException {
         final DruidConnectionHolder holder = pooledConnection.holder;
@@ -1995,6 +2056,14 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
 
         final Connection physicalConnection = holder.conn;
 
+        /**
+         * ①如果removeAbandoned被设置为true，则通过traceEnable判断是否需要从activeConnections移除该连接对象，防止流程4.2再次检测到该连接对象，
+         * 当然如果是流程4.2主动触发的该流程，那么意味着流程4.2里已经remove过该对象了，traceEnable会被置为false，
+         * 本流程就不再触发remove了（这个流程都是在removeAbandoned=true的情况下进行的，在主流程1里连接被放进activeConnections时traceEnable被置为true，
+         * 而在removeAbandoned=false的情况下traceEnable恒等于false）。
+         *
+
+         */
         if (pooledConnection.traceEnable) {
             Object oldInfo = null;
             activeConnectionLock.lock();
@@ -2015,9 +2084,32 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
 
         final boolean isAutoCommit = holder.underlyingAutoCommit;
         final boolean isReadOnly = holder.underlyingReadOnly;
+
+        /**
+         * 如果不开启testOnBorrow和testOnReturn，并且keepAlive设置为false，那么长连接可用测试的间隔依据就是利用当前时间减去上次活跃时间（lastActiveTimeMillis）得出闲置时间，
+         * 然后再利用闲置时间跟timeBetweenEvictionRunsMillis（默认60s）进行对比，超过才进行长连接可用测试。
+         *
+         * 那么如果一个mysql服务端的长连接保活时间被人为调整为60s，然后timeBetweenEvictionRunsMillis被设置为59s，这个设置是非常合理的，
+         * 保证了测试间隔小于长连接实际保活时间，然后如果这时一个连接被拿出去后一直过了61s才被close回收，该连接对象的lastActiveTimeMillis被刷为当前时间，
+         * 如果在59s内再次拿到该连接对象，就会绕过连接检查直接报连接不可用的错误。
+
+         *
+         */
+
         final boolean testOnReturn = this.testOnReturn;
 
         try {
+
+            /**
+             * ②如果回收过程中发现存在有未处理完的事务，则触发回滚（比较有可能触发这一条的是流程4.2里强制归还连接，也有可能是单纯使用连接，
+             * 开启事务却没有提交事务就直接close的情况），然后利用holder.reset进行恢复连接对象里一些属性的默认值，除此之外，holder
+             * 对象还会把由它产生的statement对象放到自己的一个arraylist里面，reset方法会循环着关闭内部未关闭的statement对象，最后清空list，
+             * 当然，statement对象自己也会记录下其产生的所有的resultSet对象，然后关闭statement时同样也会循环关闭内部未关闭的resultSet对象，
+             * 这是连接池做的一种保护措施，防止用户拿着连接对象做完一些操作没有对打开的资源关闭。
+             *
+             *
+             *
+             */
             // check need to rollback?
             if ((!isAutoCommit) && (!isReadOnly)) {
                 pooledConnection.rollback();
@@ -2029,6 +2121,9 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
                 final ReentrantLock lock = pooledConnection.lock;
                 lock.lock();
                 try {
+                    /**
+                     * connectionHolder的reset内部会关闭每一个Statement
+                     */
                     holder.reset();
                 } finally {
                     lock.unlock();
@@ -2061,6 +2156,10 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
             }
 
             if (testOnReturn) {
+                /**
+                 * 当连接使用完之后，在recycle时会检查连接是否还可用（testOnReturn  -- 其实这些属性都是体现了数据库连接池的设计和连接的生命阶段。）
+                 * ，假如可用的话会刷新lastActiveTimeMillis后放入到connections中（放在尾部，符合尾部最新的原则）
+                 */
                 boolean validate = testConnectionInternal(holder, physicalConnection);
                 if (!validate) {
                     JdbcUtils.close(physicalConnection);
@@ -2109,6 +2208,14 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
                 }
                 closeCount++;
 
+                /**
+                 *
+                 * ④直接放回池子（当前connections的尾部），然后需要注意的是putLast方法和put方法的不同之处，
+                 * putLast会把lastActiveTimeMillis置为当前时间，也就是说不管一个连接被借出去过久，只要归还了，最后活跃时间就是当前时间，
+                 * 这就会有造成某种特殊异常情况的发生（非常极端，几乎不会触发，可以选择不看）：
+                 *
+
+                 */
                 result = putLast(holder, currentTimeMillis);
                 recycleCount++;
             } finally {
@@ -2312,7 +2419,7 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
 
     DruidConnectionHolder takeLast() throws InterruptedException, SQLException {
         try {
-            //poolingCount=0表示没有空闲可用的连接
+            //poolingCount=0表示没有空闲可用的连接,  如果当前池中没有空闲连接，因为没有设置maxWait，会一直循环第获取
             while (poolingCount == 0) {
                 //发送消息唤醒 CreateThread 创建Connection
                 emptySignal(); // send signal to CreateThread create connection
@@ -2336,6 +2443,7 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
                 } finally {
                     notEmptyWaitThreadCount--;
                 }
+                // 等待次数++
                 notEmptyWaitCount++;
 
                 if (!enable) {
@@ -2348,6 +2456,14 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
                 }
             }
         } catch (InterruptedException ie) {
+            /**
+             * todo 问题这里为什么哟啊 signal？
+             *
+             * 首先当前线程是因为 线程池为空， 也就是不满足notEmpty， 调用了notEmpty的await 方法阻塞了当前线程。
+             * 当有可用的链接的时候其他线程会调用notEmpty的signal方法唤醒当前线程。
+             * 又或者当前线程 处于阻塞状态，但是其他线程调用了当前线程的interrupt方法。
+             * 此时当前线程 抛出中断异常。 但是捕获了中断异常之后为什么需要调用notEmpty的signal方法唤醒其他线程？
+             */
             notEmpty.signal(); // propagate to non-interrupted thread
             notEmptySignalCount++;
             throw ie;
@@ -2427,6 +2543,21 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
                 }
             }
 
+            /**
+             *
+             * 这里对poolingCount进行减一， 在Druid中比较难理解 的是对数据的并发访问控制。 比如poolingCount这个属性。 当我们从连接池中取出一个连接的时候需要--，当我们新创建一个连接或者归还连接的时候需要++
+             * 显然这个属性存在多线程并发访问的情况。
+             *但是在DruidDataSource的声明中并没有将其 声明为volatile， 这是为什么？
+             *
+             * 你像下面的这个逻辑，如果两个线程同时执行 poolingCount --， 然后 其中一个线程将连接池poolingCount-2的位置的连接置位空,另一个线程再次将poolingCount-2的位置置为空.
+             * 但是对于poolingCount-1的位置连接仍然存在,而且第二个线程置为空的时候同时会返回 poolingCount-2位置上的连接,此时由于线程A先操作poolingCount-2位置已经是空了.导致线程B
+             * pollingLast返回一个null,显然 pollLast方法并发访问的时候是不安全的.
+             *
+             * 实际上上pollLast和taskLast 只会在DruidDataSource.getConnectionInternal方法中被调用。而且在调用之前 使用了DruidDataSource的  lock.lockInterruptibly(); 来获取锁，
+             * 也就是说同一时刻只会有一个线程执行 pollLast 或者takeLast，从而保证了并发访问的安全性。
+             *
+             *
+             */
             decrementPoolingCount();
             //从这里 可以看出 poolingCount记录的是连接池中 还没有被使用的 可用连接数量。
             //如果某一个在Connections中的连接被做为getConnection的返回值返回出去了，那么就将其在 连接池数组connections中清空
@@ -2483,6 +2614,7 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
     public long getConnectCount() {
         lock.lock();
         try {
+            //todo  为什么 返回connectCount需要加锁？ 而下满的返回closecount又不需要加锁
             return connectCount;
         } finally {
             lock.unlock();
@@ -2911,10 +3043,13 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
 
             long lastDiscardCount = 0;
             int errorCount = 0;
+            //注意这里是死循环，当需要创建连接对象时，这个线程会收到signal，否则会一直wait
+
             for (;;) {
                 // addLast
                 try {
                     //先获取锁，对DruidDataSource中所有volatile类型的变量的修改都必须要加锁
+                    //标准用法，下面需要调用empty.await方法 需要先获取到对象上的锁
                     lock.lockInterruptibly();
                 } catch (InterruptedException e2) {
                     break;
@@ -2925,6 +3060,7 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
                 lastDiscardCount = discardCount;
 
                 try {
+                    //这个变量代表了是否有必要新增连接， 如果为true表示没有必要
                     boolean emptyWait = true;
 
                     if (createError != null
@@ -2941,11 +3077,13 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
 
                     if (emptyWait) {
                         // 必须存在线程等待，才创建连接
+                        //之类的poolingCount表示线程池中可用的线程数量， notEmptyWaitThreadCount 表示因为获取不到连接而被阻塞的线程数量
+                        //如果线程池中可用线程数量大于 阻塞线程数量
                         if (poolingCount >= notEmptyWaitThreadCount //
                                 && (!(keepAlive && activeCount + poolingCount < minIdle))
                                 && !isFailContinuous()
                         ) {
-                            //阻塞当前线程不进行创建connection
+                            //阻塞当前线程不进行创建connection，等待signal信号
                             empty.await();
                         }
 
@@ -2965,6 +3103,7 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
                     }
                     break;
                 } finally {
+
                     lock.unlock();
                 }
 
@@ -3013,7 +3152,7 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
                     continue;
                 }
 
-                //将连接放入到连接池中
+                //将连接放入到连接池中,注意该put方法会调用notEmpty.signal 即会唤醒正在等待获取连接的线程。
                 boolean result = put(connection);
                 if (!result) {
                     JdbcUtils.close(connection.getPhysicalConnection());
@@ -3119,14 +3258,26 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
             for (; iter.hasNext();) {
                 DruidPooledConnection pooledConnection = iter.next();
 
+                /**
+                 *
+                 * 在 com.alibaba.druid.pool.DruidPooledConnection#afterExecute() 和com.alibaba.druid.pool.DruidPooledConnection#beforeExecute()
+                 * 方法中 会将running设置为true或者false， 这两个方法在每次connection执行sql之前和之后都会执行。 如果running为true则表示该connection正在执行sql。
+                 */
                 if (pooledConnection.isRunning()) {
                     continue;
                 }
 
                 long timeMillis = (currrentNanos - pooledConnection.getConnectedTimeNano()) / (1000 * 1000);
 
+                /**
+                 * 连接创建时间是否大于removeAbandonedTimeoutMillis，否则结束处理
+                 */
                 if (timeMillis >= removeAbandonedTimeoutMillis) {
                     iter.remove();
+                    /**
+                     * todo 为什么？
+                     * 将connection的traceEnable设置为false，
+                     */
                     pooledConnection.setTraceEnable(false);
                     abandonedList.add(pooledConnection);
                 }
@@ -3242,6 +3393,13 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
         shrink(checkTime, keepAlive);
     }
 
+    /**
+     * 该方法在DestoryThread中执行，主要作用用于对连接进行检测，丢弃和关闭检测不通过的连接，调整连接池
+     *
+     *连接池瘦身，检查连接是否可用以及丢弃多余连接
+     * @param checkTime
+     * @param keepAlive
+     */
     public void shrink(boolean checkTime, boolean keepAlive) {
         try {
             lock.lockInterruptibly();
@@ -3254,14 +3412,33 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
         int keepAliveCount = 0;
         int fatalErrorIncrement = fatalErrorCount - fatalErrorCountLastShrink;
         fatalErrorCountLastShrink = fatalErrorCount;
-        
+
+        /**
+         * 连接池瘦身，检查连接是否可用以及丢弃多余连接
+         */
         try {
             if (!inited) {
                 return;
             }
 
+            //获取需要检测连接的数量
+            /**
+             * 首先利用poolingCount减去minIdle计算需要做丢弃检查的连接对象区间。意味着这个区间的对象有被丢弃的可能。具体要不要放进丢弃队列
+             * evictConnections要判断两个属性：
+             * （1）maxEvictableIdleTimeMillis：最大检查间隙，默认为7h。官方解释： 一个连接在池中最大生存的时间（无视检查区间，只要闲置时间超过这个时间 就一定被丢弃）
+             */
             final int checkCount = poolingCount - minIdle;
             final long currentTimeMillis = System.currentTimeMillis();
+            /**
+             * 如果当前连接对象闲置时间超过minEvictableIdleTimeMillis且下标在evictCheck区间内，则加入丢弃队列evictConnections.
+             * 如果闲置时间超过maxEvictableIdleTimeMillis，则直接放入evictConnections（一般情况下回命中第一个判断条件，除非一个连接不再检查区间，
+             * 且闲置时间超过maxEvictableIdleTimeMillis）
+             *
+             *
+             * 如果连接对象不再evictCheck区间内，且keepAlive属性为true，则判断对象闲置时间是否超出keepAliveBetweenTimeMillis（默认为60s），若超出，则意味着
+             * 该连接需要进行连接可用性检查，则将该对象放入keepAliveConnections队列
+             *
+             */
             for (int i = 0; i < poolingCount; ++i) {
                 DruidConnectionHolder connection = connections[i];
 
@@ -3271,19 +3448,26 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
                 }
 
                 if (checkTime) {
+                    //是否设置了物理连接的超时时间phyTimeoutMills, 假如设置了该时间，判断连接时间存活时间是否已经超过了phyTimeoutMills，是则放入evictConnections中
+                    //// 设置的物理链接超时时间，如MySQL默认的8小时wait_time，超过则放到待清理链接数组
+                    // phyTimeout mysql数据库8小时超时问题 ：https://github.com/alibaba/druid/issues/870
                     if (phyTimeoutMillis > 0) {
                         long phyConnectTimeMillis = currentTimeMillis - connection.connectTimeMillis;
+                        //如果当前连接 计算的 物理连接时间超过了 指定个的超时时间
                         if (phyConnectTimeMillis > phyTimeoutMillis) {
                             evictConnections[evictCount++] = connection;
                             continue;
                         }
                     }
 
+                    //计算空闲时间： 空闲时间大于minEvictableIdleTimeMills，并且索引（在连接池中的index） 小于checkCount的连接则放入evictConnections。
+                    //空闲时间小于minEvictableIdleTimeMills的不需要回收
                     long idleMillis = currentTimeMillis - connection.lastActiveTimeMillis;
 
                     if (idleMillis < minEvictableIdleTimeMillis
                             && idleMillis < keepAliveBetweenTimeMillis
                     ) {
+                        //这里为什么是break
                         break;
                     }
 
@@ -3297,21 +3481,58 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
                         }
                     }
 
+                    /**
+                     * 空闲时间超过 keepAlive指定的时间则进行判断连接是否有效
+                     */
                     if (keepAlive && idleMillis >= keepAliveBetweenTimeMillis) {
+                        /**
+                         * 对keepAliveConnections中的连接进行连接可用性检测（validateConnection方法进行检查，创建物理连接后也是使用该方法检查连接）。
+                         * 检测通过之后，继续使用该连接（采用的是先移除，检测通过再放入的方式），否则使用JdbcUtils.close()  关闭连接。
+                         */
                         keepAliveConnections[keepAliveCount++] = connection;
                     }
-                } else {
+                } else {//end if checktime
                     if (i < checkCount) {
                         evictConnections[evictCount++] = connection;
                     } else {
                         break;
                     }
                 }
-            }
+            }//end for
 
             int removeCount = evictCount + keepAliveCount;
+            /**
+             * 两个队列（evictConnections和keepAliveConnections）赋值完成后，池子会进行一次压缩，没有涉及到的链接对象会被压缩到队头。
+             */
             if (removeCount > 0) {
+                /**
+                 * 面是 System.arrayCopy的源代码声明 :
+                 *
+                 * public static void arraycopy(Object src, int srcPos, Object dest, int destPos, int length)
+                 * 代码解释:
+                 * 　　Object src : 原数组
+                 *    int srcPos : 从元数据的起始位置开始
+                 * 　　Object dest : 目标数组
+                 * 　　int destPos : 目标数组的开始起始位置
+                 * 　　int length  : 要copy的数组的长度
+                 *
+                 *
+                 *
+                 *
+                 * todo 关于这个copy有些不太懂
+                 *
+                 * 比如： connections的长度是 8， 也就是0-7， 其中 2 和4 是evict，3和6是keepAlive
+                 * 则removeCount是4
+                 * arrayCopy 则表示 connections,4,connections,0,4
+                 * 从connections的4位置开始拷贝 也就是拷贝下标为4,5,6,7的元素放置到 connections的0位置开始到4位置结束的位置，显然 拷贝的connection为 4,5,6,7 但是4时evict ，6是keepAlive。
+                 * 为什么要拷贝4和6？
+                 *
+                 */
                 System.arraycopy(connections, removeCount, connections, 0, poolingCount - removeCount);
+                /**
+                 * Fill    public static void fill(Object[] a,  int fromIndex,  int toIndex,   Object val)
+                 * 将指定的 Object 引用分配给指定 Object 数组指定范围中的每个元素。填充的范围从索引 fromIndex（包括）一直到索引 toIndex（不包括）。（如果 fromIndex==toIndex，则填充范围为空。）
+                 */
                 Arrays.fill(connections, poolingCount - removeCount, poolingCount, null);
                 poolingCount -= removeCount;
             }
@@ -3324,8 +3545,20 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
             lock.unlock();
         }
 
+        /**
+         *
+         * 然后就是处理evictConnections和keepAliveConnections两个队列了，evictConnections里的对象会被close最后释放掉，
+         * keepAliveConnections里面的对象将会其进行检测（流程参考流程1.3的isValidConnection），碰到不可用的连接会调用discard（流程1.4）抛弃掉，可用的连接会再次被放进连接池。
+         *
+         *整个流程可以看出，连接闲置后，也并非一下子就减少到minIdle的，如果之前产生一堆的连接（不超过maxActive），突然闲置了下来，则至少需要花minEvictableIdleTimeMillis的时间才可以被移出连接池，
+         * 如果一个连接闲置时间超过maxEvictableIdleTimeMillis则必定被回收，所以极端情况下（比如一个连接池从初始化后就没有再被使用过），连接池里并不会一直保持minIdle个连接，而是一个都没有，
+         * 生产环境下这是非常不常见的，默认的maxEvictableIdleTimeMillis都有7h，除非是极度冷门的系统才会出现这种情况，而开启keepAlive也不会推翻这个规则，
+         * keepAlive的优先级是低于maxEvictableIdleTimeMillis的，keepAlive只是保证了那些检查中不需要被移出连接池的连接在指定检测时间内去检测其连接活性，从而决定是否放入池子或者直接discard。
+         *
+         */
         if (evictCount > 0) {
             for (int i = 0; i < evictCount; ++i) {
+                //关闭每一个 evictConnection
                 DruidConnectionHolder item = evictConnections[i];
                 Connection connection = item.getConnection();
                 JdbcUtils.close(connection);
@@ -3343,6 +3576,11 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
 
                 boolean validate = false;
                 try {
+                    //校验 keepAliveConnection的有效性
+                    /**
+                     * 对keepAliveConnections中的连接进行连接可用性检测（validateConnection方法进行检查，创建物理连接后也是使用该方法检查连接）。
+                     * 检测通过之后，继续使用该连接（采用的是先移除，检测通过再放入的方式），否则使用JdbcUtils.close()  关闭连接。
+                     */
                     this.validateConnection(connection);
                     validate = true;
                 } catch (Throwable error) {
@@ -3389,6 +3627,7 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
             try {
                 int fillCount = minIdle - (activeCount + poolingCount + createTaskCount);
                 for (int i = 0; i < fillCount; ++i) {
+                    //唤醒CreateConnectionThread线程创建connection
                     emptySignal();
                 }
             } finally {
@@ -3404,6 +3643,13 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
         }
     }
 
+    /**
+     * 获取等待线程的数量， 什么时候线程等待？ 当然是连接池中没有链接可用的时候  ，这些线程会调用await方法阻塞，
+     * 那么具体是调用 notEmpty还是empty的await呢？
+     *
+     * 当条件不满足的时候执行await等待，因此是调用了notEmpty的await方法。
+     * @return
+     */
     public int getWaitThreadCount() {
         lock.lock();
         try {
@@ -3988,6 +4234,7 @@ public class DruidDataSource extends DruidAbstractDataSource implements DruidDat
                     LOG.info("fill connections skip.");
                     break;
                 }
+                //将连接放入
                 this.putLast(holder, System.currentTimeMillis());
                 fillCount++;
             } finally {

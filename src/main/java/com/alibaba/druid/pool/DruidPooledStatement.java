@@ -329,6 +329,11 @@ public class DruidPooledStatement extends PoolableWrapper implements Statement {
         checkOpen();
 
         incrementExecuteUpdateCount();
+        /**
+         * 将sql放入到 TransactionInfo 对象中记录
+         * 每一个DruidPooledConnection对象中都有一个TransactionInfo对象
+         *
+         */
         transactionRecord(sql);
 
         conn.beforeExecute();

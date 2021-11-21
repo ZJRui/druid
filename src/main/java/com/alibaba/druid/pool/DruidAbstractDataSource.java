@@ -210,6 +210,9 @@ public abstract class DruidAbstractDataSource extends WrapperAdapter implements 
      *
      */
     protected volatile boolean                         testOnBorrow                              = DEFAULT_TEST_ON_BORROW;
+    /***
+     * 当连接使用完之后，在recycle时会检查连接是否还可用（testOnReturn  -- 其实这些属性都是体现了数据库连接池的设计和连接的生命阶段。），假如可用的话会刷新lastActiveTimeMillis后放入到connections中（放在尾部，符合尾部最新的原则）
+     */
     protected volatile boolean                         testOnReturn                              = DEFAULT_TEST_ON_RETURN;
     protected volatile boolean                         testWhileIdle                             = DEFAULT_WHILE_IDLE;
     protected volatile boolean                         poolPreparedStatements                    = false;
@@ -235,6 +238,9 @@ public abstract class DruidAbstractDataSource extends WrapperAdapter implements 
     protected volatile int                             maxWaitThreadCount                        = -1;
     protected volatile boolean                         accessToUnderlyingConnectionAllowed       = true;
 
+    /**
+     * Druid的链接回收是交给DestroyTask处理的，连接检测间隔可以通过timeBetweenEvictionRunsMillis进行配置，默认是60s。
+     */
     protected volatile long                            timeBetweenEvictionRunsMillis             = DEFAULT_TIME_BETWEEN_EVICTION_RUNS_MILLIS;
     protected volatile int                             numTestsPerEvictionRun                    = DEFAULT_NUM_TESTS_PER_EVICTION_RUN;
     protected volatile long                            minEvictableIdleTimeMillis                = DEFAULT_MIN_EVICTABLE_IDLE_TIME_MILLIS;
@@ -256,6 +262,24 @@ public abstract class DruidAbstractDataSource extends WrapperAdapter implements 
      *          1.租借的时候放入activeConnections
      *
      *          2.DyestroyTask定时把没有放回连接池的连接关闭掉
+     *
+     *
+     *
+     * 是否移除已经被丢弃的链接。其实是连接泄漏检测。当连接被丢弃，但又未关闭释放时，会造成连接泄漏。使用这个状态可以在获取连接时，将连接放入到activeConnections中。
+     * 在DestroyTask中执行 removeAbandoned方法，对activeConnections中的 连接进行连接泄漏检测，开启 该属性会损失一部分性能。
+     *
+     *
+     * ## 主动回收连接、放置内存泄漏
+     *
+     * 这个流程是在removeAbandoned设置为true的情况下才会触发，用于回收那些拿出去的使用长期未归还（归还：调用close方法触发主流程）的链接。
+     *
+     * 先来看看activeConnections是什么,activeConnectoins用来保存当前从池子中被借出去的链接， 每次调用getConnection时，如果开启removeAbandoned，则会把
+     * 连接对象放到activeConnections，然后如果长期不调用close，那么这个被借出去的链接将永远无法被重新放回池子，这是一件很麻烦的事情， 这将存在内存泄漏的风险，因为不close，意味着池子
+     * 会不断产生新的链接放进connections，不符合连接池预期（连接池触发点是尽可能减少的创建连接），然后之前被借出去的连接对象还有一只无法被回收的风险，存在内存泄漏的风险，因此为了解决这个问题，就有了将现在
+     * 借出去还未归还的链接 做一次判断， 符合条件的将会被放置到abandonedList进行连接回收（这个list中的连接对象的abandoned将会被设置为true，标记已被处理过）
+     *
+     * 这个如果在实践中能保证每次都可以正常close，完全不用设置removeAbandoned=true，目前如果使用了类似mybatis spring等开源框架，框架内部是一定会close的，所以此项不建议设置，视情况而定
+     *
      */
     protected volatile boolean                         removeAbandoned;
     protected volatile long                            removeAbandonedTimeoutMillis              = 300 * 1000;
@@ -371,6 +395,36 @@ public abstract class DruidAbstractDataSource extends WrapperAdapter implements 
      * notEmpty： 表示不为空。 当连接池为空的时候我们 会调用notEmpty的await方法阻塞当前线程，这发生在getConnection的时候。
      * 当连接池不为空的时候，也就是CreateConnectionThread创建了连接放置到了连接池中或者其他线程归还了连接，这个时候我们会调用 notEmpty的signal方法 发出信号通知。
      * 因此条件成立的时候signal，条件不成立的时候await
+     *
+     *
+     *
+     * 注意： notEmpty 和empty都是根据 lock对象得到的Condition
+     *  在Java中调用condition对象的await或者signal方法之前需要先获取到lock对象的锁，比如下满这个使用
+     *  public static void main(String[] args) {
+     *         Lock lock=new ReentrantLock();
+     *         Condition condition=lock.newCondition();
+     *         for(int i=0;i<10;i++)
+     *         {
+     *             Thread thread=new Thread(()->
+     *             {
+     *                 lock.lock();
+     *                 try {
+     *                     condition.await();
+     *                 } catch (InterruptedException e) {
+     *                     e.printStackTrace();
+     *                 }finally {
+     *                     lock.unlock();
+     *                 }
+     *             });
+     *             thread.start();
+     *         }
+     *     }
+     *
+     *
+     * 我们知道调用Object对象的wait方法和notify方法也是需要synchronized（obj）的
+     *
+     *
+     *
      */
     protected Condition                                notEmpty;
     /**
@@ -1540,6 +1594,10 @@ public abstract class DruidAbstractDataSource extends WrapperAdapter implements 
                 result = validConnectionChecker.isValidConnection(conn, validationQuery, validationQueryTimeout);
 
                 if (result && onFatalError) {
+                    /**
+                     * todo  为啥对onFatalError的修改还需要进行加锁？
+                     *
+                     */
                     lock.lock();
                     try {
                         if (onFatalError) {
@@ -1809,6 +1867,11 @@ public abstract class DruidAbstractDataSource extends WrapperAdapter implements 
         return conn;
     }
 
+    /***
+     * 这个方法 不需要做 并发访问限制， 他使用Driver.connect 创建connection，可以多线程并发 创建物理连接。
+     * @return
+     * @throws SQLException
+     */
     public PhysicalConnectionInfo createPhysicalConnection() throws SQLException {
         String url = this.getUrl();
         Properties connectProperties = getConnectProperties();

@@ -52,11 +52,23 @@ public final class DruidConnectionHolder {
     protected final List<ConnectionEventListener> connectionEventListeners = new CopyOnWriteArrayList<ConnectionEventListener>();
     protected final List<StatementEventListener>  statementEventListeners  = new CopyOnWriteArrayList<StatementEventListener>();
     protected final long                          connectTimeMillis;
+    /**
+     * 最新活跃时间，刷新时机：
+     * 1，执行完sql之后就会刷新
+     * 比如executeQuery中调用afterExecute方法
+     * 2，keepAlive 检查通过之后刷新
+     * 3，初始化。创建物理连接时：
+     * lastActiveTimeMillis=connectTimeMillis==System.currentTimeMillis()
+     *
+     */
     protected volatile long                       lastActiveTimeMillis;
     protected volatile long                       lastExecTimeMillis;
     protected volatile long                       lastKeepTimeMillis;
     protected volatile long                       lastValidTimeMillis;
     protected long                                useCount                 = 0;
+    /**
+     * 用于统计计数。在shrink中，对连接进行keepAlive检查的时候就会递增
+     */
     private long                                  keepAliveCheckCount      = 0;
     private long                                  lastNotEmptyWaitNanos;
     private final long                            createNanoSpan;
